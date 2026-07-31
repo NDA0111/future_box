@@ -11,9 +11,15 @@ import {
 } from 'react-native';
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import ConfettiCannon from 'react-native-confetti-cannon';
-import { getCapsule, markCapsuleOpened, saveReflectionAnswer } from '../../src/services/storage';
+import {
+  deleteCapsule,
+  getCapsule,
+  markCapsuleOpened,
+  saveReflectionAnswer,
+} from '../../src/services/storage';
 import { deriveStatus } from '../../src/utils/deriveStatus';
 import { Snackbar } from '../../src/components/Snackbar';
+import { DeleteConfirmModal } from '../../src/components/DeleteConfirmModal';
 import type { ReflectionAnswer, TimeCapsule } from '../../src/types/capsule';
 import { colors, radii, spacing, typography } from '../../src/constants/theme';
 
@@ -56,6 +62,12 @@ export default function CapsuleDetailScreen() {
   // the matching effect screen right after the user picks an answer.
   const [reflectionPhase, setReflectionPhase] = useState<'hidden' | 'ask' | 'yes' | 'no'>('hidden');
   const [reflectionSaveError, setReflectionSaveError] = useState<string | null>(null);
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+  // True only during the unbox reveal animation (tap -> confetti/scale ->
+  // markCapsuleOpened resolves). Blocks delete in that narrow window so a
+  // delete can't race markCapsuleOpened writing to an already-removed record.
+  const [unboxing, setUnboxing] = useState(false);
   const confettiRef = useRef<ConfettiCannon>(null);
   const reflectionConfettiRef = useRef<ConfettiCannon>(null);
   const contentFade = useRef(new Animated.Value(0)).current;
@@ -101,12 +113,19 @@ export default function CapsuleDetailScreen() {
     };
   }, [id, router, contentFade]);
 
+  useEffect(() => {
+    if (!deleteError) return;
+    const timer = setTimeout(() => setDeleteError(null), 3000);
+    return () => clearTimeout(timer);
+  }, [deleteError]);
+
   async function handleUnbox() {
     // Guard against double-tap / duplicate invocation firing the animation
     // and markCapsuleOpened() twice (storage layer is idempotent, but the
     // animation itself is not).
     if (unboxingRef.current || revealed) return;
     unboxingRef.current = true;
+    setUnboxing(true);
     confettiRef.current?.start();
     Animated.sequence([
       Animated.timing(boxScale, { toValue: 1.1, duration: 200, useNativeDriver: true }),
@@ -118,8 +137,12 @@ export default function CapsuleDetailScreen() {
       // already saw the reveal for (Reliability NFR, same principle as F7
       // deriveStatus's clock-rollback guard).
       const updated = await markCapsuleOpened(id);
+      // The delete button is guarded (disabled) while unboxing===true, so this
+      // capsule can't have been deleted out from under us mid-animation; guard
+      // is still checked here in case the screen navigated away in between.
       if (updated) setCapsule(updated);
       setRevealed(true);
+      setUnboxing(false);
       Animated.timing(contentFade, { toValue: 1, duration: 400, useNativeDriver: true }).start();
     });
   }
@@ -158,6 +181,22 @@ export default function CapsuleDetailScreen() {
     }
   }
 
+  // F10 — deletes this capsule (any status) after confirmation, then returns
+  // to Home; applies regardless of where the user is in the unbox/reflection
+  // flow. Guarded against the unbox animation window by the trash button
+  // being disabled while `unboxing` is true (see header render below); this
+  // extra check covers it too in case the button is somehow triggered anyway.
+  async function handleDelete() {
+    if (unboxing) return;
+    try {
+      await deleteCapsule(id);
+      router.replace('/');
+    } catch {
+      setShowDeleteConfirm(false);
+      setDeleteError('Không thể xóa hộp. Vui lòng thử lại.');
+    }
+  }
+
   if (blockedReason) {
     return (
       <View style={styles.flex}>
@@ -175,6 +214,13 @@ export default function CapsuleDetailScreen() {
       <View style={styles.header}>
         <Pressable onPress={() => router.back()} hitSlop={12}>
           <Text style={styles.headerAction}>‹ Back</Text>
+        </Pressable>
+        <Pressable
+          onPress={() => setShowDeleteConfirm(true)}
+          disabled={unboxing}
+          hitSlop={12}
+        >
+          <Text style={[styles.headerAction, unboxing && styles.headerActionDisabled]}>🗑</Text>
         </Pressable>
       </View>
 
@@ -245,6 +291,11 @@ export default function CapsuleDetailScreen() {
           </Pressable>
         </Animated.View>
       )}
+
+      {showDeleteConfirm && (
+        <DeleteConfirmModal onCancel={() => setShowDeleteConfirm(false)} onConfirm={handleDelete} />
+      )}
+      {deleteError && <Snackbar message={deleteError} />}
     </View>
   );
 }
@@ -347,8 +398,15 @@ function ReflectionReadOnly({
 
 const styles = StyleSheet.create({
   flex: { flex: 1, backgroundColor: colors.background },
-  header: { paddingHorizontal: spacing.md, paddingVertical: spacing.md },
+  header: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingHorizontal: spacing.md,
+    paddingVertical: spacing.md,
+  },
   headerAction: { ...typography.body, color: colors.primaryDark },
+  headerActionDisabled: { opacity: 0.4 },
   unboxWrap: { flex: 1, alignItems: 'center', justifyContent: 'center', gap: spacing.md },
   unboxEmoji: { fontSize: 96 },
   unboxHint: { ...typography.body, color: colors.textMuted },

@@ -1,16 +1,20 @@
 import { useCallback, useEffect, useState } from 'react';
 import {
+  LayoutAnimation,
+  Platform,
   Pressable,
   RefreshControl,
   SectionList,
   StyleSheet,
   Text,
+  UIManager,
   View,
 } from 'react-native';
 import { useFocusEffect, useRouter } from 'expo-router';
-import { listCapsules } from '../src/services/storage';
+import { deleteCapsule, listCapsules } from '../src/services/storage';
 import { deriveStatus } from '../src/utils/deriveStatus';
 import { Snackbar } from '../src/components/Snackbar';
+import { DeleteConfirmModal } from '../src/components/DeleteConfirmModal';
 import type { CapsuleStatus, TimeCapsule } from '../src/types/capsule';
 import { colors, radii, spacing, typography } from '../src/constants/theme';
 
@@ -19,6 +23,11 @@ import { colors, radii, spacing, typography } from '../src/constants/theme';
  * entry point (F4). Presentation layer per screens.md "Home (Danh sách hộp)";
  * happy-path only, edge cases (e.g. storage errors) for agent-react.
  */
+
+// Old Android renderer needs an explicit opt-in for LayoutAnimation (no-op on iOS/new arch).
+if (Platform.OS === 'android' && UIManager.setLayoutAnimationEnabledExperimental) {
+  UIManager.setLayoutAnimationEnabledExperimental(true);
+}
 
 type Section = { key: CapsuleStatus; title: string; data: TimeCapsule[] };
 
@@ -69,6 +78,8 @@ export default function HomeScreen() {
   const [capsules, setCapsules] = useState<TimeCapsule[]>([]);
   const [refreshing, setRefreshing] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [deleteTargetId, setDeleteTargetId] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     try {
@@ -94,10 +105,41 @@ export default function HomeScreen() {
     return () => clearTimeout(timer);
   }, [loadError]);
 
+  useEffect(() => {
+    if (!deleteError) return;
+    const timer = setTimeout(() => setDeleteError(null), 3000);
+    return () => clearTimeout(timer);
+  }, [deleteError]);
+
   async function handleRefresh() {
     setRefreshing(true);
     await load();
     setRefreshing(false);
+  }
+
+  // F10 — long-press any card (any status) to delete. Removal from the list
+  // only happens *after* deleteCapsule() (cancel notif -> delete photo ->
+  // delete record -> update index) actually succeeds — no optimistic removal,
+  // so a real storage/notification failure never makes a card vanish while
+  // the record still exists underneath.
+  async function handleConfirmDelete() {
+    if (!deleteTargetId) return;
+    const id = deleteTargetId;
+    try {
+      await deleteCapsule(id);
+      // Animate the row's removal (fade + collapse, ~200ms) instead of an
+      // instant snap per screens.md.
+      LayoutAnimation.configureNext(
+        LayoutAnimation.create(200, LayoutAnimation.Types.easeInEaseOut, LayoutAnimation.Properties.opacity)
+      );
+      setCapsules((prev) => prev.filter((c) => c.id !== id));
+      setDeleteTargetId(null);
+    } catch {
+      // Close the confirm dialog either way — leaving it stuck on "Đang
+      // xóa..." forever would be worse than a Snackbar retry prompt.
+      setDeleteTargetId(null);
+      setDeleteError('Không thể xóa hộp. Vui lòng thử lại.');
+    }
   }
 
   const sections = buildSections(capsules, new Date());
@@ -142,6 +184,7 @@ export default function HomeScreen() {
               return (
                 <Pressable
                   onPress={() => router.push(`/capsule/${item.id}`)}
+                  onLongPress={() => setDeleteTargetId(item.id)}
                   style={({ pressed }) => [styles.readyCard, pressed && styles.cardPressed]}
                 >
                   <Text style={styles.readyIcon}>💌</Text>
@@ -154,18 +197,22 @@ export default function HomeScreen() {
             }
             if (section.key === 'locked') {
               return (
-                <View style={styles.lockedCard}>
+                <Pressable
+                  onLongPress={() => setDeleteTargetId(item.id)}
+                  style={({ pressed }) => [styles.lockedCard, pressed && styles.cardPressed]}
+                >
                   <Text style={styles.lockedIcon}>🔒</Text>
                   <View style={styles.cardTextWrap}>
                     <Text style={styles.cardTitle}>{item.title}</Text>
                     <Text style={styles.countdown}>{formatCountdown(item.openDate, new Date())}</Text>
                   </View>
-                </View>
+                </Pressable>
               );
             }
             return (
               <Pressable
                 onPress={() => router.push(`/capsule/${item.id}`)}
+                onLongPress={() => setDeleteTargetId(item.id)}
                 style={({ pressed }) => [styles.openedRow, pressed && styles.cardPressed]}
               >
                 <Text style={styles.cardTitle}>{item.title}</Text>
@@ -182,7 +229,13 @@ export default function HomeScreen() {
           }}
         />
       )}
-      {loadError && <Snackbar message={loadError} />}
+      {(deleteError || loadError) && <Snackbar message={deleteError ?? loadError ?? ''} />}
+      {deleteTargetId && (
+        <DeleteConfirmModal
+          onCancel={() => setDeleteTargetId(null)}
+          onConfirm={handleConfirmDelete}
+        />
+      )}
     </View>
   );
 }
