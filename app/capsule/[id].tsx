@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, type RefObject, useRef, useState } from 'react';
 import {
   Animated,
   Dimensions,
@@ -11,18 +11,25 @@ import {
 } from 'react-native';
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import ConfettiCannon from 'react-native-confetti-cannon';
-import { getCapsule, markCapsuleOpened } from '../../src/services/storage';
+import { getCapsule, markCapsuleOpened, saveReflectionAnswer } from '../../src/services/storage';
 import { deriveStatus } from '../../src/utils/deriveStatus';
 import { Snackbar } from '../../src/components/Snackbar';
-import type { TimeCapsule } from '../../src/types/capsule';
+import type { ReflectionAnswer, TimeCapsule } from '../../src/types/capsule';
 import { colors, radii, spacing, typography } from '../../src/constants/theme';
 
 /**
- * Mở hộp (F4) + Xem lại hộp đã mở — one shared route per task scope: a
- * capsule that is `ready` plays the unbox moment once; a capsule already
- * `opened` renders the same content statically, no animation (screens.md
- * "Mở hộp" + "Xem lại hộp đã mở"). Happy path only — F5 (câu hỏi phản tư) is
- * a separate feature/task, not wired up here yet (see handoff note below).
+ * Mở hộp (F4) + Câu hỏi phản tư (F5) + Xem lại hộp đã mở (F11) — one shared
+ * route: a capsule that is `ready` plays the unbox moment once; a capsule
+ * already `opened` renders the same content statically, no animation
+ * (screens.md "Mở hộp" + "Xem lại hộp đã mở").
+ *
+ * Design decision (screens.md explicitly allows this): "Câu hỏi phản tư" is
+ * described as its own screen, but screens.md's own note on "Xem lại hộp đã
+ * mở" says agent-react may keep it as one route "nếu thuận tiện hơn cho điều
+ * hướng, miễn giữ đúng hành vi". Embedding avoids passing the loaded capsule
+ * back and forth across a nav round-trip, since this screen already holds
+ * the record in state. The reflection UI is a `reflectionPhase` sub-state of
+ * this same component instead of a separate file.
  */
 
 function formatDateTime(iso: string): string {
@@ -44,10 +51,17 @@ export default function CapsuleDetailScreen() {
   const [revealed, setRevealed] = useState(false);
   const [imageError, setImageError] = useState(false);
   const [blockedReason, setBlockedReason] = useState<string | null>(null);
+  // F5 — 'hidden': not asking (no question, or viewing content before "Tiếp
+  // tục" is tapped). 'ask': showing the Yes/No question. 'yes'/'no': showing
+  // the matching effect screen right after the user picks an answer.
+  const [reflectionPhase, setReflectionPhase] = useState<'hidden' | 'ask' | 'yes' | 'no'>('hidden');
+  const [reflectionSaveError, setReflectionSaveError] = useState<string | null>(null);
   const confettiRef = useRef<ConfettiCannon>(null);
+  const reflectionConfettiRef = useRef<ConfettiCannon>(null);
   const contentFade = useRef(new Animated.Value(0)).current;
   const boxScale = useRef(new Animated.Value(1)).current;
   const unboxingRef = useRef(false);
+  const reflectionSubmittingRef = useRef(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -111,10 +125,37 @@ export default function CapsuleDetailScreen() {
   }
 
   function handleContinue() {
-    // F5 (câu hỏi phản tư) is out of scope for this task even when
-    // reflectionQuestion is set — always return Home for now; agent-react/
-    // next feature wires the branch to the Reflection screen.
+    // F5 decision point: only ask if there's a question AND it hasn't been
+    // answered yet (screens.md "Câu hỏi phản tư" + F5 AC "lưu 1 lần").
+    if (capsule && capsule.reflectionQuestion && capsule.reflectionAnswer == null) {
+      setReflectionPhase('ask');
+      return;
+    }
     router.replace('/');
+  }
+
+  async function handleAnswer(answer: ReflectionAnswer) {
+    // Guard against double-tap firing saveReflectionAnswer() twice before
+    // reflectionPhase updates and the Yes/No buttons unmount (same pattern as
+    // unboxingRef for handleUnbox).
+    if (!capsule || reflectionSubmittingRef.current) return;
+    reflectionSubmittingRef.current = true;
+    // Optimistic update: show the matching effect immediately. Per
+    // f5-reflection.md's error-handling row, a storage write failure here
+    // must never block the emotional payoff — the effect plays regardless,
+    // and a failed save is surfaced as a non-blocking Snackbar instead.
+    setReflectionPhase(answer);
+    if (answer === 'yes') reflectionConfettiRef.current?.start();
+    try {
+      const updated = await saveReflectionAnswer(id, answer);
+      if (updated) setCapsule(updated);
+    } catch {
+      // Retry is skipped for MVP (writes are local MMKV, not network — a
+      // failure here means a genuine local storage problem a silent retry
+      // won't fix). Just warn; F4's openedAt is already persisted and does
+      // not depend on this step.
+      setReflectionSaveError('Không thể lưu câu trả lời, nhưng đừng lo — bạn vẫn có thể tiếp tục.');
+    }
   }
 
   if (blockedReason) {
@@ -151,6 +192,17 @@ export default function CapsuleDetailScreen() {
             autoStart={false}
           />
         </Pressable>
+      ) : reflectionPhase !== 'hidden' ? (
+        <>
+          <ReflectionQuestionView
+            question={capsule.reflectionQuestion ?? ''}
+            phase={reflectionPhase}
+            onAnswer={handleAnswer}
+            onDone={() => router.replace('/')}
+            confettiRef={reflectionConfettiRef}
+          />
+          {reflectionSaveError && <Snackbar message={reflectionSaveError} />}
+        </>
       ) : (
         <Animated.View style={{ opacity: contentFade, flex: 1 }}>
           <ScrollView contentContainerStyle={styles.content}>
@@ -175,15 +227,120 @@ export default function CapsuleDetailScreen() {
             )}
 
             <Text style={styles.message}>{capsule.message}</Text>
+
+            {/* F11 — xem lại hộp đã mở: nhúng câu hỏi + câu trả lời đã lưu,
+                chỉ xem, không cho chọn lại (screens.md "Xem lại hộp đã mở" #4). */}
+            {capsule.reflectionQuestion && capsule.reflectionAnswer != null && (
+              <ReflectionReadOnly
+                question={capsule.reflectionQuestion}
+                answer={capsule.reflectionAnswer}
+              />
+            )}
           </ScrollView>
 
           <Pressable onPress={handleContinue} style={styles.continueButton}>
             <Text style={styles.continueLabel}>
-              {capsule.reflectionQuestion ? 'Tiếp tục' : 'Xong'}
+              {capsule.reflectionQuestion && capsule.reflectionAnswer == null ? 'Tiếp tục' : 'Xong'}
             </Text>
           </Pressable>
         </Animated.View>
       )}
+    </View>
+  );
+}
+
+/** F5 — Yes/No question, then the matching Yes/No effect screen (screens.md
+ * "Câu hỏi phản tư" #1-3b). Buttons disable immediately on tap to avoid a
+ * double-tap re-saving/overwriting the answer. */
+function ReflectionQuestionView({
+  question,
+  phase,
+  onAnswer,
+  onDone,
+  confettiRef,
+}: {
+  question: string;
+  phase: 'ask' | 'yes' | 'no';
+  onAnswer: (answer: ReflectionAnswer) => void;
+  onDone: () => void;
+  confettiRef: RefObject<ConfettiCannon | null>;
+}) {
+  if (phase === 'ask') {
+    return (
+      <View style={styles.reflectWrap}>
+        <Text style={styles.reflectQuestion}>{question}</Text>
+        <View style={styles.reflectButtons}>
+          <Pressable
+            onPress={() => onAnswer('yes')}
+            style={[styles.reflectButton, styles.reflectButtonYes]}
+          >
+            <Text style={styles.reflectButtonLabel}>Yes</Text>
+          </Pressable>
+          <Pressable
+            onPress={() => onAnswer('no')}
+            style={[styles.reflectButton, styles.reflectButtonNo]}
+          >
+            <Text style={[styles.reflectButtonLabel, styles.reflectButtonNoLabel]}>No</Text>
+          </Pressable>
+        </View>
+      </View>
+    );
+  }
+
+  return (
+    <View style={styles.reflectWrap}>
+      <ConfettiCannon
+        ref={confettiRef}
+        count={100}
+        origin={{ x: SCREEN_WIDTH / 2, y: 0 }}
+        fadeOut
+        autoStart={false}
+      />
+      <Text style={styles.reflectResultEmoji}>{phase === 'yes' ? '🎉' : '💛'}</Text>
+      <Text style={styles.reflectResultText}>
+        {phase === 'yes'
+          ? 'Tuyệt vời! Chúc mừng bạn 🎉'
+          : 'Không sao cả, mỗi hành trình đều có nhịp riêng. Tiếp tục cố gắng nhé!'}
+      </Text>
+      <Pressable onPress={onDone} style={styles.continueButton}>
+        <Text style={styles.continueLabel}>Về trang chủ</Text>
+      </Pressable>
+    </View>
+  );
+}
+
+/** F11 read-only mode: same question, the previously chosen answer shown
+ * selected/highlighted, the other muted, neither tappable. */
+function ReflectionReadOnly({
+  question,
+  answer,
+}: {
+  question: string;
+  answer: ReflectionAnswer;
+}) {
+  return (
+    <View style={styles.reflectReadOnly}>
+      <Text style={styles.reflectReadOnlyQuestion}>{question}</Text>
+      <View style={styles.reflectButtons}>
+        <View
+          style={[
+            styles.reflectButton,
+            styles.reflectButtonYes,
+            answer !== 'yes' && styles.reflectButtonMuted,
+          ]}
+        >
+          <Text style={styles.reflectButtonLabel}>Yes</Text>
+        </View>
+        <View
+          style={[
+            styles.reflectButton,
+            styles.reflectButtonNo,
+            answer !== 'no' && styles.reflectButtonMuted,
+          ]}
+        >
+          <Text style={[styles.reflectButtonLabel, styles.reflectButtonNoLabel]}>No</Text>
+        </View>
+      </View>
     </View>
   );
 }
@@ -218,4 +375,38 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   continueLabel: { ...typography.heading, color: colors.surface },
+  reflectWrap: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: spacing.lg,
+    gap: spacing.lg,
+  },
+  reflectQuestion: { ...typography.title, color: colors.text, textAlign: 'center' },
+  reflectButtons: { flexDirection: 'row', gap: spacing.md },
+  reflectButton: {
+    minWidth: 120,
+    minHeight: 44,
+    paddingVertical: spacing.md,
+    paddingHorizontal: spacing.lg,
+    borderRadius: radii.md,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  reflectButtonYes: { backgroundColor: colors.accent },
+  reflectButtonNo: { backgroundColor: colors.surfaceMuted, borderWidth: 1, borderColor: colors.border },
+  reflectButtonLabel: { ...typography.heading, color: colors.surface },
+  reflectButtonNoLabel: { color: colors.text },
+  reflectButtonMuted: { opacity: 0.4 },
+  reflectResultEmoji: { fontSize: 72 },
+  reflectResultText: { ...typography.body, color: colors.text, textAlign: 'center' },
+  reflectReadOnly: {
+    marginTop: spacing.lg,
+    paddingTop: spacing.lg,
+    borderTopWidth: 1,
+    borderTopColor: colors.border,
+    alignItems: 'center',
+    gap: spacing.md,
+  },
+  reflectReadOnlyQuestion: { ...typography.heading, color: colors.text, textAlign: 'center' },
 });
