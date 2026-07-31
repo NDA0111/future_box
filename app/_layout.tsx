@@ -13,6 +13,7 @@ export default function RootLayout() {
       >
         <Stack.Screen name="index" />
         <Stack.Screen name="create-capsule" options={{ presentation: 'modal' }} />
+        <Stack.Screen name="capsule/[id]" />
       </Stack>
       <StatusBar style="dark" />
     </>
