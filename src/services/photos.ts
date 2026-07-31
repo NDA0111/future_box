@@ -18,17 +18,24 @@ function getPhotosDirectory(): Directory {
   return dir;
 }
 
+export type PhotoPickResult = {
+  uri: string | null;
+  /** True only when the library permission was actually denied — lets the
+   * caller show feedback (F1 edge case table), unlike a plain user cancel. */
+  permissionDenied: boolean;
+};
+
 /**
  * Launches the image library, copies the chosen image into app storage, and
- * returns its stable `photoUri`. Returns `null` if the user cancels or
+ * returns its stable `photoUri`. `uri` is `null` if the user cancels or
  * permission is denied — capsule creation must still proceed without a photo
  * (F1/F8 AC: photo is optional).
  */
-export async function pickAndSavePhoto(): Promise<string | null> {
+export async function pickAndSavePhoto(): Promise<PhotoPickResult> {
   try {
     const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
     if (!permission.granted) {
-      return null;
+      return { uri: null, permissionDenied: true };
     }
 
     const result = await ImagePicker.launchImageLibraryAsync({
@@ -37,17 +44,17 @@ export async function pickAndSavePhoto(): Promise<string | null> {
       quality: 0.7,
     });
     if (result.canceled || result.assets.length === 0) {
-      return null;
+      return { uri: null, permissionDenied: false };
     }
 
     const sourceUri = result.assets[0].uri;
     const source = new File(sourceUri);
     const destination = new File(getPhotosDirectory(), `${generateId()}${source.extension || '.jpg'}`);
     await source.copy(destination, { overwrite: true });
-    return destination.uri;
+    return { uri: destination.uri, permissionDenied: false };
   } catch {
     // Picker/copy failure is a soft-fail: capsule creation continues without a photo.
-    return null;
+    return { uri: null, permissionDenied: false };
   }
 }
 
